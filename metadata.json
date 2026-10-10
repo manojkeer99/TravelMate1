@@ -1,0 +1,8 @@
+{
+  "name": "Remix TravelMate",
+  "description": "Discover destinations, build practical itineraries, manage travel budgets, and travel with confidence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
