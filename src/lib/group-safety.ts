@@ -1,7 +1,24 @@
 export const DEFAULT_GROUP_RANGE_METERS = 500;
-export const MIN_GROUP_RANGE_METERS = 100;
+export const MIN_GROUP_RANGE_METERS = 50;
 export const MAX_GROUP_RANGE_METERS = 10_000;
 export const LOCATION_STALE_AFTER_MS = 10 * 60 * 1000;
+
+export const SAFETY_RADIUS_PRESETS = [
+  { value: 100, label: "100 m", description: "100 metres" },
+  { value: 250, label: "250 m", description: "250 metres" },
+  { value: 500, label: "500 m", description: "500 metres" },
+  { value: 1000, label: "1,000 m (1 km)", description: "1,000 metres (1 km)" },
+  { value: 2000, label: "2,000 m (2 km)", description: "2,000 metres (2 km)" },
+] as const;
+
+export function formatRadiusDistance(meters: number): string {
+  const rounded = Math.round(meters);
+  if (rounded >= 1000) {
+    const km = rounded / 1000;
+    return `${rounded.toLocaleString("en-IN")} metres (${Number.isInteger(km) ? km : km.toFixed(2)} km)`;
+  }
+  return `${rounded.toLocaleString("en-IN")} metres`;
+}
 
 export function cleanGroupText(value: unknown, maxLength: number) {
   return typeof value === "string" ? value.trim().replace(/\s+/g, " ").slice(0, maxLength) : "";

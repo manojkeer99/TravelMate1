@@ -7,6 +7,7 @@ import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
+import { OAuth2Client } from "google-auth-library";
 import { destinations, findDestination, createItinerary, udaipurHeritageCircuit } from "./src/lib/travel-data.ts";
 import { buildLocalTravelAnswer, sanitizeHistory, type AssistantInput } from "./src/lib/travel-assistant.ts";
 import {
@@ -23,6 +24,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: "5mb" }));
@@ -40,6 +42,7 @@ type User = {
   preferredTripType: string | null;
   isAdmin: boolean;
   createdAt: string;
+  googleSub?: string | null;
 };
 
 type Session = {
@@ -205,11 +208,48 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
 
 // --- API ROUTES ---
 
+function createSessionAndSetCookie(res: Response, req: Request, userId: number): string {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  dbStore.sessions.push({
+    id: crypto.randomUUID(),
+    userId,
+    tokenHash: hashToken(rawToken),
+    expiresAt: Date.now() + 14 * 86400000,
+  });
+
+  const isSecure = Boolean(
+    process.env.NODE_ENV === "production" ||
+    process.env.APP_URL?.startsWith("https://") ||
+    req.secure ||
+    req.headers["x-forwarded-proto"] === "https"
+  );
+
+  res.cookie("travelmate_session", rawToken, {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: "lax",
+    maxAge: 14 * 86400000,
+    path: "/",
+  });
+
+  return rawToken;
+}
+
+// --- API ROUTES ---
+
 // Config
 app.get("/api/config", (_req: Request, res: Response) => {
   const geminiAvailable = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+  const rawClientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "";
+  const googleClientId = rawClientId.trim().replace(/^["']|["']$/g, "");
+  const googleConfigured = Boolean(googleClientId);
+
   res.json({
-    auth: { googleConfigured: false, sessionsConfigured: true },
+    auth: {
+      googleConfigured,
+      googleClientId: googleConfigured ? googleClientId : undefined,
+      sessionsConfigured: true,
+    },
     ai: {
       providerConfigured: geminiAvailable,
       activeProvider: geminiAvailable ? "gemini" : "local",
@@ -234,8 +274,8 @@ app.get("/api/auth", (req: Request, res: Response) => {
   });
 });
 
-app.post("/api/auth", (req: Request, res: Response) => {
-  const { action, email, password, name } = req.body || {};
+app.post("/api/auth", async (req: Request, res: Response) => {
+  const { action, email, password, name, idToken } = req.body || {};
   const cleanEmail = String(email || "").trim().toLowerCase();
 
   if (action === "logout") {
@@ -244,12 +284,121 @@ app.post("/api/auth", (req: Request, res: Response) => {
       const hash = hashToken(token);
       dbStore.sessions = dbStore.sessions.filter((s) => s.tokenHash !== hash);
     }
-    res.clearCookie("travelmate_session", { path: "/" });
+    const isSecure = Boolean(
+      process.env.NODE_ENV === "production" ||
+      process.env.APP_URL?.startsWith("https://") ||
+      req.secure ||
+      req.headers["x-forwarded-proto"] === "https"
+    );
+    res.clearCookie("travelmate_session", {
+      path: "/",
+      httpOnly: true,
+      secure: isSecure,
+      sameSite: "lax",
+    });
     return res.json({ ok: true });
   }
 
   if (action === "forgot") {
     return res.json({ message: "Password reset instructions sent if an account exists." });
+  }
+
+  if (action === "google") {
+    const rawIdToken = String(idToken || "").trim();
+    if (!rawIdToken) {
+      return res.status(400).json({ error: "Missing Google ID token." });
+    }
+
+    const rawClientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || "";
+    const googleClientId = rawClientId.trim().replace(/^["']|["']$/g, "");
+    if (!googleClientId) {
+      return res.status(503).json({
+        error: "Google authentication is not configured on this server (GOOGLE_CLIENT_ID is not set).",
+      });
+    }
+
+    let payload;
+    try {
+      const authClient = new OAuth2Client(googleClientId);
+      const ticket = await authClient.verifyIdToken({
+        idToken: rawIdToken,
+        audience: googleClientId,
+      });
+      payload = ticket.getPayload();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Token verification failed";
+      return res.status(401).json({ error: `Google verification failed: ${msg}` });
+    }
+
+    if (!payload || !payload.sub) {
+      return res.status(401).json({ error: "Invalid Google token payload." });
+    }
+
+    if (!payload.email || !payload.email_verified) {
+      return res.status(400).json({ error: "Google account email is not verified." });
+    }
+
+    const verifiedSub = payload.sub;
+    const verifiedEmail = payload.email.toLowerCase().trim();
+    const verifiedName = payload.name?.trim() || verifiedEmail.split("@")[0];
+    const verifiedAvatar = payload.picture || null;
+
+    // 1. Locate account by permanent Google subject identifier
+    let user = dbStore.users.find((u) => u.googleSub === verifiedSub);
+
+    // 2. If not matched by sub, check if an account exists for this verified email
+    if (!user) {
+      const userByEmail = dbStore.users.find((u) => u.email === verifiedEmail);
+      if (userByEmail) {
+        // Prevent linking if already tied to a distinct Google sub
+        if (userByEmail.googleSub && userByEmail.googleSub !== verifiedSub) {
+          return res.status(409).json({ error: "This email is already associated with another Google account." });
+        }
+        // Safely link Google sub to existing account
+        userByEmail.googleSub = verifiedSub;
+        if (!userByEmail.avatarUrl && verifiedAvatar) {
+          userByEmail.avatarUrl = verifiedAvatar;
+        }
+        if ((!userByEmail.name || userByEmail.name === verifiedEmail.split("@")[0]) && verifiedName) {
+          userByEmail.name = verifiedName;
+        }
+        user = userByEmail;
+      }
+    }
+
+    // 3. If neither found, create a new verified user account
+    if (!user) {
+      user = {
+        id: dbStore.nextId.user++,
+        name: verifiedName,
+        email: verifiedEmail,
+        passwordHash: `google:${crypto.randomBytes(16).toString("hex")}`,
+        avatarUrl: verifiedAvatar,
+        travelPreferences: ["Heritage", "Culture", "Food"],
+        preferredBudget: "Standard",
+        preferredTripType: "Culture",
+        isAdmin: dbStore.users.length === 0,
+        createdAt: new Date().toISOString(),
+        googleSub: verifiedSub,
+      };
+      dbStore.users.push(user);
+    } else {
+      if (verifiedAvatar && !user.avatarUrl) {
+        user.avatarUrl = verifiedAvatar;
+      }
+    }
+
+    createSessionAndSetCookie(res, req, user.id);
+
+    return res.json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        avatarUrl: user.avatarUrl,
+        isAdmin: user.isAdmin,
+      },
+    });
   }
 
   if (action === "signup") {
@@ -272,23 +421,11 @@ app.post("/api/auth", (req: Request, res: Response) => {
       preferredTripType: "Mixed",
       isAdmin: dbStore.users.length === 0,
       createdAt: new Date().toISOString(),
+      googleSub: null,
     };
     dbStore.users.push(newUser);
 
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    dbStore.sessions.push({
-      id: crypto.randomUUID(),
-      userId: newUser.id,
-      tokenHash: hashToken(rawToken),
-      expiresAt: Date.now() + 14 * 86400000,
-    });
-
-    res.cookie("travelmate_session", rawToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      maxAge: 14 * 86400000,
-      path: "/",
-    });
+    createSessionAndSetCookie(res, req, newUser.id);
 
     return res.json({
       user: {
@@ -316,23 +453,11 @@ app.post("/api/auth", (req: Request, res: Response) => {
         preferredTripType: "Mixed",
         isAdmin: false,
         createdAt: new Date().toISOString(),
+        googleSub: null,
       };
       dbStore.users.push(createdUser);
 
-      const rawToken = crypto.randomBytes(32).toString("hex");
-      dbStore.sessions.push({
-        id: crypto.randomUUID(),
-        userId: createdUser.id,
-        tokenHash: hashToken(rawToken),
-        expiresAt: Date.now() + 14 * 86400000,
-      });
-
-      res.cookie("travelmate_session", rawToken, {
-        httpOnly: true,
-        sameSite: "lax",
-        maxAge: 14 * 86400000,
-        path: "/",
-      });
+      createSessionAndSetCookie(res, req, createdUser.id);
 
       return res.json({
         user: {
@@ -345,20 +470,7 @@ app.post("/api/auth", (req: Request, res: Response) => {
       });
     }
 
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    dbStore.sessions.push({
-      id: crypto.randomUUID(),
-      userId: user.id,
-      tokenHash: hashToken(rawToken),
-      expiresAt: Date.now() + 14 * 86400000,
-    });
-
-    res.cookie("travelmate_session", rawToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      maxAge: 14 * 86400000,
-      path: "/",
-    });
+    createSessionAndSetCookie(res, req, user.id);
 
     return res.json({
       user: {

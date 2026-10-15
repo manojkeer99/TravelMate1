@@ -5,6 +5,7 @@ import {
   Copy,
   LocateFixed,
   MapPin,
+  Navigation,
   Pause,
   Play,
   Plus,
@@ -15,13 +16,51 @@ import {
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { destinations, findDestination, type Destination } from "@/lib/travel-data";
 import GroupSafetyMap, { type GroupMapMember } from "@/components/group-safety-map";
+import {
+  SAFETY_RADIUS_PRESETS,
+  formatRadiusDistance,
+  safeRangeMeters,
+  MIN_GROUP_RANGE_METERS,
+  MAX_GROUP_RANGE_METERS,
+} from "@/lib/group-safety";
 
 type GroupUser = { id: number; name: string; email: string } | null;
-type GroupSummary = { id: number; name: string; destination: string; inviteCode: string | null; rangeMeters: number; isActive: boolean; ownerUserId: number; sharingEnabled: boolean };
+type GroupSummary = {
+  id: number;
+  name: string;
+  destination: string;
+  inviteCode: string | null;
+  rangeMeters: number;
+  isActive: boolean;
+  ownerUserId: number;
+  sharingEnabled: boolean;
+};
 type GroupMember = GroupMapMember & { userId: number; avatarUrl: string | null; sharingEnabled: boolean };
-type SafetyEvent = { id: number; kind: "range_breach" | "sos" | string; message: string; memberId: number | null; acknowledged: boolean; createdAt: string };
-type GroupStatus = { group: Omit<GroupSummary, "sharingEnabled">; selfMemberId: number; members: GroupMember[]; events: SafetyEvent[]; refreshedAt: string };
+type SafetyEvent = {
+  id: number;
+  kind: "range_breach" | "sos" | string;
+  message: string;
+  memberId: number | null;
+  acknowledged: boolean;
+  createdAt: string;
+};
+type GroupStatus = {
+  group: Omit<GroupSummary, "sharingEnabled">;
+  selfMemberId: number;
+  members: GroupMember[];
+  events: SafetyEvent[];
+  refreshedAt: string;
+};
 type PushReadiness = { push?: { configured?: boolean; publicKey?: string | null } };
+
+type LiveCoords = {
+  latitude: number;
+  longitude: number;
+  accuracyMeters: number;
+  timestamp: number;
+};
+
+type GpsStatus = "idle" | "locating" | "active" | "permission_denied" | "unavailable" | "timeout";
 
 function urlBase64ToUint8Array(value: string) {
   const padding = "=".repeat((4 - (value.length % 4)) % 4);
@@ -39,17 +78,20 @@ function formatUpdatedAt(value: string | null) {
 }
 
 function relativeDistance(a: GroupMember | undefined, b: GroupMember) {
-  if (!a?.locationVisible || a.latitude === null || a.longitude === null || !b.locationVisible || b.latitude === null || b.longitude === null) return null;
+  if (!a?.locationVisible || a.latitude === null || a.longitude === null || !b.locationVisible || b.latitude === null || b.longitude === null)
+    return null;
   const radians = (value: number) => (value * Math.PI) / 180;
   const latDelta = radians(b.latitude - a.latitude);
   const lngDelta = radians(b.longitude - a.longitude);
-  const root = Math.sin(latDelta / 2) ** 2 + Math.cos(radians(a.latitude)) * Math.cos(radians(b.latitude)) * Math.sin(lngDelta / 2) ** 2;
+  const root =
+    Math.sin(latDelta / 2) ** 2 + Math.cos(radians(a.latitude)) * Math.cos(radians(b.latitude)) * Math.sin(lngDelta / 2) ** 2;
   return Math.round(2 * 6_371_000 * Math.atan2(Math.sqrt(root), Math.sqrt(1 - root)));
 }
 
 function playAlertTone() {
   try {
-    const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AudioContextClass =
+      window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioContextClass) return;
     const context = new AudioContextClass();
     const oscillator = context.createOscillator();
@@ -70,7 +112,15 @@ function playAlertTone() {
   }
 }
 
-export default function GroupSafetyPanel({ user, destination, onRequireAuth }: { user: GroupUser; destination: Destination; onRequireAuth: () => void }) {
+export default function GroupSafetyPanel({
+  user,
+  destination,
+  onRequireAuth,
+}: {
+  user: GroupUser;
+  destination: Destination;
+  onRequireAuth: () => void;
+}) {
   const [groups, setGroups] = useState<GroupSummary[]>([]);
   const [activeGroupId, setActiveGroupId] = useState<number | null>(null);
   const [status, setStatus] = useState<GroupStatus | null>(null);
@@ -83,8 +133,24 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
   const [notice, setNotice] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [confirmSos, setConfirmSos] = useState(false);
-  const [createForm, setCreateForm] = useState({ name: `${destination.name} travel group`, destination: destination.name, rangeMeters: 500 });
+
+  // Group creation state
+  const [createForm, setCreateForm] = useState({
+    name: `${destination.name} travel group`,
+    destination: destination.name,
+    rangeMeters: 500,
+  });
+
+  // Dynamic Safety Radius state
   const [rangeDraft, setRangeDraft] = useState(500);
+  const [isCustomRadiusMode, setIsCustomRadiusMode] = useState(false);
+  const [customRadiusInput, setCustomRadiusInput] = useState("500");
+  const [customRadiusError, setCustomRadiusError] = useState<string | null>(null);
+
+  // Live GPS Tracking state
+  const [gpsStatus, setGpsStatus] = useState<GpsStatus>("idle");
+  const [liveCoords, setLiveCoords] = useState<LiveCoords | null>(null);
+
   const watchIdRef = useRef<number | null>(null);
   const activeGroupRef = useRef<number | null>(null);
   const sharingRef = useRef(false);
@@ -98,12 +164,23 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
   const visibleMembers = status?.members.filter((member) => member.locationVisible) ?? [];
   const activeAlertCount = status?.events.filter((event) => event.kind === "range_breach" || event.kind === "sos").length ?? 0;
 
-  useEffect(() => { activeGroupRef.current = activeGroupId; }, [activeGroupId]);
-  useEffect(() => { sharingRef.current = sharingLive; }, [sharingLive]);
-  useEffect(() => { setCreateForm((current) => ({ ...current, destination: current.destination || destination.name })); }, [destination.name]);
+  useEffect(() => {
+    activeGroupRef.current = activeGroupId;
+  }, [activeGroupId]);
 
   useEffect(() => {
-    if (!user) { setLoading(false); return; }
+    sharingRef.current = sharingLive;
+  }, [sharingLive]);
+
+  useEffect(() => {
+    setCreateForm((current) => ({ ...current, destination: current.destination || destination.name }));
+  }, [destination.name]);
+
+  useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
     void loadGroups();
   }, [user?.id]);
 
@@ -131,9 +208,24 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
     return () => window.clearInterval(timer);
   }, [activeGroupId, user?.id]);
 
+  // When group status loads or changes, sync radius from storage or server
   useEffect(() => {
     if (!status) return;
-    setRangeDraft(status.group.rangeMeters);
+    const groupId = status.group.id;
+    // Check if user has a custom radius stored in localStorage for this group
+    const savedLocalRadius = localStorage.getItem(`travelmate_safety_radius_${groupId}`);
+    if (savedLocalRadius && !Number.isNaN(Number(savedLocalRadius))) {
+      const parsed = safeRangeMeters(Number(savedLocalRadius));
+      setRangeDraft(parsed);
+      setCustomRadiusInput(String(parsed));
+      setIsCustomRadiusMode(!SAFETY_RADIUS_PRESETS.some((preset) => preset.value === parsed));
+    } else {
+      const initial = status.group.rangeMeters || 500;
+      setRangeDraft(initial);
+      setCustomRadiusInput(String(initial));
+      setIsCustomRadiusMode(!SAFETY_RADIUS_PRESETS.some((preset) => preset.value === initial));
+    }
+
     const ids = status.events.map((event) => event.id);
     if (!eventsInitializedRef.current) {
       seenEventsRef.current = new Set(ids);
@@ -145,14 +237,20 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
       seenEventsRef.current.add(event.id);
       if (event.kind === "range_breach" || event.kind === "sos") announceSafetyEvent(event);
     });
-  }, [status]);
+  }, [status?.group?.id]);
 
-  useEffect(() => () => {
-    if (watchIdRef.current !== null) navigator.geolocation?.clearWatch(watchIdRef.current);
-    const groupId = activeGroupRef.current;
-    if (sharingRef.current && groupId) {
-      void fetch(`/api/groups/${groupId}/location`, { method: "DELETE", keepalive: true });
-    }
+  // Clean up GPS watcher and remove live position on unmount
+  useEffect(() => {
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation?.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      const groupId = activeGroupRef.current;
+      if (sharingRef.current && groupId) {
+        void fetch(`/api/groups/${groupId}/location`, { method: "DELETE", keepalive: true });
+      }
+    };
   }, []);
 
   async function loadGroups(selectNewest = false) {
@@ -160,10 +258,15 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
       setLoading(true);
       const response = await fetch("/api/groups", { cache: "no-store" });
       const data = (await response.json()) as { groups?: GroupSummary[]; error?: string };
-      if (!response.ok) { setNotice(data.error || "Could not load your travel groups."); return; }
+      if (!response.ok) {
+        setNotice(data.error || "Could not load your travel groups.");
+        return;
+      }
       const nextGroups = data.groups || [];
       setGroups(nextGroups);
-      setActiveGroupId((current) => (selectNewest ? nextGroups[0]?.id ?? null : current && nextGroups.some((group) => group.id === current) ? current : nextGroups[0]?.id ?? null));
+      setActiveGroupId((current) =>
+        selectNewest ? nextGroups[0]?.id ?? null : current && nextGroups.some((group) => group.id === current) ? current : nextGroups[0]?.id ?? null
+      );
     } catch {
       setNotice("Could not connect to group safety. Please try again.");
     } finally {
@@ -175,11 +278,16 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
     try {
       const response = await fetch(`/api/groups/${groupId}/status`, { cache: "no-store" });
       const data = (await response.json()) as GroupStatus & { error?: string };
-      if (!response.ok) { setNotice(data.error || "Could not refresh the group map."); return; }
+      if (!response.ok) {
+        setNotice(data.error || "Could not refresh the group map.");
+        return;
+      }
       setStatus(data);
-      setGroups((current) => current.map((group) => (group.id === groupId ? { ...group, rangeMeters: data.group.rangeMeters, isActive: data.group.isActive } : group)));
+      setGroups((current) =>
+        current.map((group) => (group.id === groupId ? { ...group, rangeMeters: data.group.rangeMeters, isActive: data.group.isActive } : group))
+      );
     } catch {
-      // Keep last good state on network glitch
+      // Keep last good state on temporary network glitch
     }
   }
 
@@ -187,13 +295,19 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
     setNotice(event.kind === "sos" ? `SOS received: ${event.message}` : `Range alert: ${event.message}`);
     playAlertTone();
     if ("Notification" in window && Notification.permission === "granted") {
-      new Notification(event.kind === "sos" ? "TravelMate SOS" : "TravelMate range alert", { body: event.message, tag: `travelmate-group-${event.id}` });
+      new Notification(event.kind === "sos" ? "TravelMate SOS" : "TravelMate range alert", {
+        body: event.message,
+        tag: `travelmate-group-${event.id}`,
+      });
     }
   }
 
   async function createGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!user) { onRequireAuth(); return; }
+    if (!user) {
+      onRequireAuth();
+      return;
+    }
     setBusy(true);
     try {
       const response = await fetch("/api/groups", {
@@ -202,7 +316,10 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
         body: JSON.stringify(createForm),
       });
       const data = (await response.json()) as { group?: GroupSummary; error?: string };
-      if (!response.ok || !data.group) { setNotice(data.error || "Could not create the group."); return; }
+      if (!response.ok || !data.group) {
+        setNotice(data.error || "Could not create the group.");
+        return;
+      }
       setGroups((current) => [{ ...data.group! }, ...current]);
       setStatus(null);
       setActiveGroupId(data.group.id);
@@ -216,7 +333,10 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
 
   async function joinGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!user) { onRequireAuth(); return; }
+    if (!user) {
+      onRequireAuth();
+      return;
+    }
     setBusy(true);
     try {
       const response = await fetch("/api/groups/join", {
@@ -225,7 +345,10 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
         body: JSON.stringify({ inviteCode: joinCode }),
       });
       const data = (await response.json()) as { group?: GroupSummary; joined?: boolean; message?: string; error?: string };
-      if (!response.ok || !data.group) { setNotice(data.error || "Could not join that group."); return; }
+      if (!response.ok || !data.group) {
+        setNotice(data.error || "Could not join that group.");
+        return;
+      }
       setGroups((current) => (current.some((group) => group.id === data.group!.id) ? current : [{ ...data.group! }, ...current]));
       setStatus(null);
       setActiveGroupId(data.group.id);
@@ -238,33 +361,54 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
     }
   }
 
-  async function sendPosition(position: GeolocationPosition) {
+  // Throttled transmission of position to server (maintains breach detection)
+  async function sendPosition(position: GeolocationPosition | { coords: { latitude: number; longitude: number; accuracy: number } }) {
     const groupId = activeGroupRef.current;
-    if (!groupId || Date.now() - lastSentRef.current < 5_500) return;
-    lastSentRef.current = Date.now();
+    if (!groupId) return;
+    const now = Date.now();
+    if (now - lastSentRef.current < 5_000) return;
+    lastSentRef.current = now;
+
     try {
       const response = await fetch(`/api/groups/${groupId}/location`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ latitude: position.coords.latitude, longitude: position.coords.longitude, accuracyMeters: position.coords.accuracy }),
+        body: JSON.stringify({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          accuracyMeters: position.coords.accuracy,
+        }),
       });
-      const data = (await response.json()) as { isOutOfRange?: boolean; breaches?: Array<{ name: string; distanceMeters: number }>; error?: string };
-      if (!response.ok) { setNotice(data.error || "Could not update your shared location."); return; }
+      const data = (await response.json()) as {
+        isOutOfRange?: boolean;
+        breaches?: Array<{ name: string; distanceMeters: number }>;
+        error?: string;
+      };
+      if (!response.ok) {
+        setNotice(data.error || "Could not update your shared location.");
+        return;
+      }
       if (data.isOutOfRange) {
         const nearest = data.breaches?.[0];
-        const alert = nearest ? `You are ${nearest.distanceMeters.toLocaleString("en-IN")} m from ${nearest.name}; your group range is exceeded.` : "You are outside your selected group range.";
+        const alert = nearest
+          ? `You are ${nearest.distanceMeters.toLocaleString("en-IN")} m from ${nearest.name}; your group range is exceeded.`
+          : "You are outside your selected group range.";
         setNotice(alert);
         playAlertTone();
-        if ("Notification" in window && Notification.permission === "granted") new Notification("TravelMate range alert", { body: alert, tag: "travelmate-own-range" });
+        if ("Notification" in window && Notification.permission === "granted")
+          new Notification("TravelMate range alert", { body: alert, tag: "travelmate-own-range" });
       }
       void loadStatus(groupId);
     } catch {
-      setNotice("Your location could not be sent. Check your internet connection and try again.");
+      // Temporary network issue: circle remains active locally
     }
   }
 
   async function enableBackgroundAlerts() {
-    if (!user) { onRequireAuth(); return; }
+    if (!user) {
+      onRequireAuth();
+      return;
+    }
     if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
       setNotice("This browser does not support background notifications. You will still receive in-app safety alerts while TravelMate is open.");
       return;
@@ -285,14 +429,19 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
       }
       const registration = await navigator.serviceWorker.register("/sw.js");
       await navigator.serviceWorker.ready;
-      const subscription = (await registration.pushManager.getSubscription()) || (await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(publicKey) }));
+      const subscription =
+        (await registration.pushManager.getSubscription()) ||
+        (await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(publicKey) }));
       const response = await fetch("/api/push/subscribe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(subscription.toJSON()),
       });
       const data = (await response.json()) as { error?: string };
-      if (!response.ok) { setNotice(data.error || "Could not enable background alerts on this device."); return; }
+      if (!response.ok) {
+        setNotice(data.error || "Could not enable background alerts on this device.");
+        return;
+      }
       setPushConfigured(true);
       setPushEnabled(true);
       setNotice("Background SOS and range alerts are enabled on this device.");
@@ -301,49 +450,106 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
     }
   }
 
+  // --- START SAFETY / GPS TRACKING CONTROLS ---
   function startSharing() {
-    if (!user) { onRequireAuth(); return; }
-    if (!currentGroup?.isActive) { setNotice("The organiser has paused safety sharing for this group."); return; }
+    if (!user) {
+      onRequireAuth();
+      return;
+    }
+    if (!currentGroup?.isActive) {
+      setNotice("The organiser has paused safety sharing for this group.");
+      return;
+    }
     if (typeof window !== "undefined" && !window.isSecureContext) {
+      setGpsStatus("unavailable");
       setNotice("Location sharing requires an HTTPS secure connection. Please access TravelMate over HTTPS.");
       return;
     }
-    if (!navigator.geolocation) { setNotice("This browser does not support location sharing. Try a mobile browser."); return; }
-    if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission();
+    if (!navigator.geolocation) {
+      setGpsStatus("unavailable");
+      setNotice("This browser does not support GPS location tracking. Please try on a mobile browser.");
+      return;
+    }
+
+    if ("Notification" in window && Notification.permission === "default") {
+      void Notification.requestPermission();
+    }
+
     setLocating(true);
+    setGpsStatus("locating");
+    setNotice("Acquiring initial GPS position...");
+
     navigator.geolocation.getCurrentPosition(
       (position) => {
         setLocating(false);
         setSharingLive(true);
+        setGpsStatus("active");
+
+        const initialCoords: LiveCoords = {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          accuracyMeters: Math.round(position.coords.accuracy || 10),
+          timestamp: Date.now(),
+        };
+        setLiveCoords(initialCoords);
         void sendPosition(position);
+
+        // Start watching for GPS movement
+        if (watchIdRef.current !== null) {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+        }
+
         watchIdRef.current = navigator.geolocation.watchPosition(
-          (nextPosition) => void sendPosition(nextPosition),
+          (nextPosition) => {
+            // When user moves, immediately update coordinates to shift circle center
+            setLiveCoords({
+              latitude: nextPosition.coords.latitude,
+              longitude: nextPosition.coords.longitude,
+              accuracyMeters: Math.round(nextPosition.coords.accuracy || 10),
+              timestamp: Date.now(),
+            });
+            setGpsStatus("active");
+            void sendPosition(nextPosition);
+          },
           (err) => {
             if (err.code === err.PERMISSION_DENIED) {
-              setNotice("Location permission was denied. Please allow location access in your browser settings.");
+              setGpsStatus("permission_denied");
+              setSharingLive(false);
+              if (watchIdRef.current !== null) {
+                navigator.geolocation.clearWatch(watchIdRef.current);
+                watchIdRef.current = null;
+              }
+              setNotice("Location permission was revoked. Safety tracking has stopped.");
+            } else if (err.code === err.POSITION_UNAVAILABLE) {
+              setGpsStatus("unavailable");
+              setNotice("GPS signal became unavailable. Check device location services.");
             } else if (err.code === err.TIMEOUT) {
-              setNotice("Location request timed out. Please try again.");
-            } else {
-              setNotice("Location permission was interrupted. You can retry sharing when ready.");
+              setGpsStatus("timeout");
             }
           },
-          { enableHighAccuracy: true, maximumAge: 15_000, timeout: 15_000 }
+          { enableHighAccuracy: true, maximumAge: 5_000, timeout: 15_000 }
         );
-        setNotice("Live location sharing is on. Keep TravelMate open during your group outing.");
+
+        setNotice(`Safety tracking active. Safety circle is centered on your GPS position (radius: ${formatRadiusDistance(rangeDraft)}).`);
       },
       (err) => {
         setLocating(false);
+        setSharingLive(false);
         if (err.code === err.PERMISSION_DENIED) {
-          setNotice("Location permission was denied. Please allow location access in your browser settings or choose a location manually.");
+          setGpsStatus("permission_denied");
+          setNotice("Location permission was denied. Please allow location access in your browser or device settings.");
         } else if (err.code === err.POSITION_UNAVAILABLE) {
-          setNotice("We couldn't determine your current location. Please check your GPS/network connection or try again.");
+          setGpsStatus("unavailable");
+          setNotice("GPS location is unavailable on this device or network. Please check device location settings.");
         } else if (err.code === err.TIMEOUT) {
-          setNotice("Location request timed out. Please try again.");
+          setGpsStatus("timeout");
+          setNotice("GPS location request timed out. Please try again or check your signal.");
         } else {
-          setNotice("Location permission was not granted. Nothing has been shared.");
+          setGpsStatus("idle");
+          setNotice("Could not access location. Please check browser permissions.");
         }
       },
-      { enableHighAccuracy: true, maximumAge: 15_000, timeout: 15_000 }
+      { enableHighAccuracy: true, maximumAge: 10_000, timeout: 12_000 }
     );
   }
 
@@ -354,13 +560,71 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
       watchIdRef.current = null;
     }
     setSharingLive(false);
+    setGpsStatus("idle");
+    setLiveCoords(null);
+
     if (!groupId) return;
     try {
       await fetch(`/api/groups/${groupId}/location`, { method: "DELETE" });
       await loadStatus(groupId);
-      setNotice("Live location sharing is off and your last shared point has been removed.");
+      setNotice("Safety tracking stopped. Your location is private and your last shared point has been cleared.");
     } catch {
-      setNotice("Location sharing was stopped in this browser.");
+      setNotice("Safety tracking stopped on this device.");
+    }
+  }
+
+  // Verification helper: simulate walking ~15 metres North (useful for testing movement in browser DevTools or desktop)
+  function simulateStepNorth() {
+    if (!liveCoords) return;
+    // 0.000135 degrees latitude is roughly 15 metres
+    const nextCoords: LiveCoords = {
+      ...liveCoords,
+      latitude: liveCoords.latitude + 0.000135,
+      timestamp: Date.now(),
+    };
+    setLiveCoords(nextCoords);
+    void sendPosition({ coords: { latitude: nextCoords.latitude, longitude: nextCoords.longitude, accuracy: nextCoords.accuracyMeters } });
+    setNotice("Simulated 15m walk North: circle centre moved to new GPS coordinates; radius remained unchanged.");
+  }
+
+  // --- DISTANCE SELECTOR HANDLERS ---
+  function handleSelectPreset(presetMeters: number) {
+    setIsCustomRadiusMode(false);
+    setCustomRadiusError(null);
+    setRangeDraft(presetMeters);
+    setCustomRadiusInput(String(presetMeters));
+    if (activeGroupId) {
+      localStorage.setItem(`travelmate_safety_radius_${activeGroupId}`, String(presetMeters));
+    }
+    setNotice(`Safety radius set to ${formatRadiusDistance(presetMeters)}.`);
+  }
+
+  function handleSelectCustom() {
+    setIsCustomRadiusMode(true);
+    setCustomRadiusError(null);
+  }
+
+  function handleCustomDistanceChange(val: string) {
+    setCustomRadiusInput(val);
+    const parsed = Number(val);
+    if (!val || Number.isNaN(parsed)) {
+      setCustomRadiusError("Please enter a valid distance in metres.");
+      return;
+    }
+    if (parsed < MIN_GROUP_RANGE_METERS) {
+      setCustomRadiusError(`Minimum safety radius is ${MIN_GROUP_RANGE_METERS} metres.`);
+      return;
+    }
+    if (parsed > MAX_GROUP_RANGE_METERS) {
+      setCustomRadiusError(`Maximum safety radius is ${MAX_GROUP_RANGE_METERS.toLocaleString("en-IN")} metres (10 km).`);
+      return;
+    }
+
+    const cleanRadius = Math.round(parsed);
+    setCustomRadiusError(null);
+    setRangeDraft(cleanRadius);
+    if (activeGroupId) {
+      localStorage.setItem(`travelmate_safety_radius_${activeGroupId}`, String(cleanRadius));
     }
   }
 
@@ -374,9 +638,12 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
         body: JSON.stringify({ groupId: currentGroup.id, rangeMeters: rangeDraft }),
       });
       const data = (await response.json()) as { group?: GroupSummary; error?: string };
-      if (!response.ok) { setNotice(data.error || "Could not update the group range."); return; }
+      if (!response.ok) {
+        setNotice(data.error || "Could not update the group range.");
+        return;
+      }
       await loadStatus(currentGroup.id);
-      setNotice(`Group safety radius updated to ${data.group?.rangeMeters ?? rangeDraft} m.`);
+      setNotice(`Group safety radius updated to ${data.group?.rangeMeters ?? rangeDraft} m across the group.`);
     } catch {
       setNotice("Could not save the group range. Please try again.");
     } finally {
@@ -405,7 +672,10 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
         body: JSON.stringify({}),
       });
       const data = (await response.json()) as { event?: SafetyEvent; error?: string };
-      if (!response.ok || !data.event) { setNotice(data.error || "Could not send SOS."); return; }
+      if (!response.ok || !data.event) {
+        setNotice(data.error || "Could not send SOS.");
+        return;
+      }
       announceSafetyEvent(data.event);
       await loadStatus(currentGroup.id);
     } catch {
@@ -417,7 +687,10 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
 
   const memberRows = useMemo(() => {
     const myMember = status?.members.find((member) => member.isSelf);
-    return (status?.members || []).map((member) => ({ ...member, distance: member.isSelf ? 0 : relativeDistance(myMember, member) }));
+    return (status?.members || []).map((member) => ({
+      ...member,
+      distance: member.isSelf ? 0 : relativeDistance(myMember, member),
+    }));
   }, [status]);
 
   if (!user) {
@@ -427,7 +700,10 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
           <UsersRound size={31} />
           <p className="tm-eyebrow">PRIVATE GROUP SAFETY</p>
           <h3>Travel together. Stay connected.</h3>
-          <p>Create a private group for your trek, forest visit, mountain trail, or city day out. Each person chooses whether to share their own live location.</p>
+          <p>
+            Create a private group for your trek, forest visit, mountain trail, or city day out. Each person chooses whether to share
+            their own live location.
+          </p>
           <button type="button" className="tm-primary-button" onClick={onRequireAuth}>
             Sign in to start a group
           </button>
@@ -437,13 +713,20 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
     );
   }
 
+  const selectedPresetMatch = !isCustomRadiusMode && SAFETY_RADIUS_PRESETS.some((p) => p.value === rangeDraft);
+
   return (
     <div className="tm-group-body">
       <div className="tm-group-intro">
-        <span><UsersRound size={19} /></span>
+        <span>
+          <UsersRound size={19} />
+        </span>
         <div>
           <b>Group safety, with consent</b>
-          <p>Create a private group for 4–5 friends or family. The organiser sets a radius (500 m default) and alerts trigger when a sharing member moves beyond it.</p>
+          <p>
+            Create a private group for friends or family. Set your safety radius and alerts trigger when a sharing member moves beyond
+            the safety circle.
+          </p>
         </div>
       </div>
 
@@ -489,17 +772,23 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                 ))}
               </select>
             </label>
-            <label>
-              Default safety radius <b>{createForm.rangeMeters} m</b>
-              <input
-                type="range"
-                min="100"
-                max="2000"
-                step="100"
-                value={createForm.rangeMeters}
-                onChange={(event) => setCreateForm((current) => ({ ...current, rangeMeters: Number(event.target.value) }))}
-              />
-            </label>
+            <div style={{ marginBottom: 14 }}>
+              <label style={{ display: "block", marginBottom: 6 }}>
+                Default safety radius: <b>{formatRadiusDistance(createForm.rangeMeters)}</b>
+              </label>
+              <div className="tm-range-presets">
+                {SAFETY_RADIUS_PRESETS.map((preset) => (
+                  <button
+                    type="button"
+                    key={preset.value}
+                    className={createForm.rangeMeters === preset.value ? "is-selected" : ""}
+                    onClick={() => setCreateForm((current) => ({ ...current, rangeMeters: preset.value }))}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <button type="submit" className="tm-primary-button" disabled={busy}>
               <Plus size={16} /> {busy ? "Creating..." : "Create private group"}
             </button>
@@ -513,7 +802,9 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                 placeholder="Enter invite code"
                 maxLength={32}
               />
-              <button type="submit" disabled={busy}>Join group</button>
+              <button type="submit" disabled={busy}>
+                Join group
+              </button>
             </form>
           </div>
         </div>
@@ -551,13 +842,27 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                   <p className="tm-eyebrow">PRIVATE GROUP • {currentGroup.destination.toUpperCase()}</p>
                   <h3>{currentGroup.name}</h3>
                   <p>
-                    <UsersRound size={14} /> {status.members.length} member{status.members.length === 1 ? "" : "s"} • <Radio size={14} /> {visibleMembers.length} sharing now
+                    <UsersRound size={14} /> {status.members.length} member{status.members.length === 1 ? "" : "s"} • <Radio size={14} />{" "}
+                    {visibleMembers.length} sharing now
                   </p>
                 </div>
                 {confirmSos ? (
                   <div style={{ display: "flex", gap: 6 }}>
-                    <button type="button" style={{ background: "#d95057", color: "#fff", padding: "6px 12px", borderRadius: 8, fontWeight: 800 }} onClick={() => void executeSos()} disabled={busy}>Confirm SOS</button>
-                    <button type="button" style={{ background: "rgba(255,255,255,0.2)", color: "#fff", padding: "6px 12px", borderRadius: 8 }} onClick={() => setConfirmSos(false)}>Cancel</button>
+                    <button
+                      type="button"
+                      style={{ background: "#d95057", color: "#fff", padding: "6px 12px", borderRadius: 8, fontWeight: 800 }}
+                      onClick={() => void executeSos()}
+                      disabled={busy}
+                    >
+                      Confirm SOS
+                    </button>
+                    <button
+                      type="button"
+                      style={{ background: "rgba(255,255,255,0.2)", color: "#fff", padding: "6px 12px", borderRadius: 8 }}
+                      onClick={() => setConfirmSos(false)}
+                    >
+                      Cancel
+                    </button>
                   </div>
                 ) : (
                   <button type="button" className="tm-group-sos" onClick={() => setConfirmSos(true)} disabled={busy}>
@@ -583,30 +888,110 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                 </div>
               )}
 
+              {/* GPS / Permission Error Banners */}
+              {gpsStatus === "permission_denied" && (
+                <div className="tm-gps-alert-box is-denied">
+                  <AlertTriangle size={18} />
+                  <div>
+                    <b>Location Permission Denied</b>
+                    <p>
+                      TravelMate cannot display your live safety circle because browser location permissions are blocked. Please click the
+                      lock/site settings icon in your browser address bar to allow location access, then tap <b>Start Safety</b>.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {gpsStatus === "unavailable" && (
+                <div className="tm-gps-alert-box is-unavailable">
+                  <AlertTriangle size={18} />
+                  <div>
+                    <b>GPS Signal Unavailable</b>
+                    <p>
+                      Could not retrieve valid GPS coordinates. Check that your device location service / GPS is enabled, and try again.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {gpsStatus === "locating" && (
+                <div className="tm-gps-alert-box is-locating">
+                  <Radio size={18} />
+                  <div>
+                    <b>Acquiring GPS fix...</b>
+                    <p>Requesting high-accuracy coordinates from your device to place your safety circle.</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Start Safety / Stop Safety Controls */}
               <div className="tm-share-card">
                 <div>
                   <span className={sharingLive ? "is-sharing" : ""}>{sharingLive ? <Radio size={18} /> : <LocateFixed size={18} />}</span>
                   <div>
-                    <b>{sharingLive ? "You are sharing live location" : "Your location is private"}</b>
-                    <p>{sharingLive ? "Your latest point updates for this group while this panel stays open." : "Start sharing only when you want this group to see your location."}</p>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 3 }}>
+                      <b>{sharingLive ? "Live GPS Safety Tracking" : "Safety Tracking Inactive"}</b>
+                      <span className={`tm-tracking-status-badge ${sharingLive ? "is-active" : "is-inactive"}`}>
+                        {sharingLive ? (
+                          <>
+                            <span className="tm-pulse-dot" /> Tracking active
+                          </>
+                        ) : (
+                          "Location private"
+                        )}
+                      </span>
+                    </div>
+                    <p>
+                      {sharingLive
+                        ? "The safety circle moves dynamically with your live GPS location. Keep TravelMate open."
+                        : "Tap Start Safety to draw your safety circle around your live GPS coordinates."}
+                    </p>
+                    {sharingLive && liveCoords ? (
+                      <div style={{ marginTop: 4, fontSize: "10px", color: "#64748b" }}>
+                        GPS: {liveCoords.latitude.toFixed(5)}, {liveCoords.longitude.toFixed(5)} (±{liveCoords.accuracyMeters} m)
+                        <br />
+                        <button
+                          type="button"
+                          className="tm-test-move-btn"
+                          onClick={simulateStepNorth}
+                          title="Simulate walking 15m North to test circle movement"
+                        >
+                          <Navigation size={12} /> Test move +15m North (simulate step)
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
                 {sharingLive ? (
                   <button type="button" className="tm-stop-sharing" onClick={() => void stopSharing()}>
-                    <Pause size={16} /> Stop sharing
+                    <Pause size={16} /> Stop Safety
                   </button>
                 ) : (
-                  <button type="button" className="tm-primary-button" onClick={startSharing} disabled={locating || !currentGroup.isActive}>
-                    <Play size={16} fill="currentColor" /> {locating ? "Locating..." : "Start sharing"}
+                  <button
+                    type="button"
+                    className="tm-primary-button"
+                    onClick={startSharing}
+                    disabled={locating || !currentGroup.isActive}
+                  >
+                    <Play size={16} fill="currentColor" /> {locating ? "Starting..." : "Start Safety"}
                   </button>
                 )}
               </div>
 
+              {/* Device Background Alerts */}
               <div className={`tm-push-card ${pushEnabled ? "is-enabled" : ""}`}>
-                <span><BellRing size={17} /></span>
+                <span>
+                  <BellRing size={17} />
+                </span>
                 <div>
                   <b>{pushEnabled ? "Background alerts enabled" : "Enable device safety alerts"}</b>
-                  <p>{pushEnabled ? "This device can receive SOS and range alerts when TravelMate is not open." : pushConfigured ? "Allow notifications for SOS and group range alerts on this device." : "In-app alerts are active while TravelMate is open."}</p>
+                  <p>
+                    {pushEnabled
+                      ? "This device can receive SOS and range alerts when TravelMate is not open."
+                      : pushConfigured
+                      ? "Allow notifications for SOS and group range alerts on this device."
+                      : "In-app alerts are active while TravelMate is open."}
+                  </p>
                 </div>
                 {!pushEnabled && (
                   <button type="button" onClick={() => void enableBackgroundAlerts()}>
@@ -615,35 +1000,109 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                 )}
               </div>
 
+              {/* CUSTOMIZABLE SAFETY RADIUS SELECTOR */}
               <div className="tm-group-range">
                 <div>
-                  <span><Radio size={17} /></span>
+                  <span>
+                    <Radio size={17} />
+                  </span>
                   <div>
-                    <p className="tm-eyebrow">GROUP SAFETY RADIUS</p>
-                    <b>{currentGroup.rangeMeters.toLocaleString("en-IN")} metres</b>
-                    <small>{isOwner ? "You control this shared limit." : "Set by the group organiser."}</small>
+                    <p className="tm-eyebrow">CUSTOMIZABLE SAFETY RADIUS</p>
+                    <b>{formatRadiusDistance(rangeDraft)}</b>
+                    <small>
+                      {isOwner
+                        ? "You are the group organiser. You can apply and save this limit to the entire group."
+                        : `Your personal safety circle is ${formatRadiusDistance(rangeDraft)} (Group alert limit: ${formatRadiusDistance(currentGroup.rangeMeters)}).`}
+                    </small>
                   </div>
                 </div>
-                {isOwner ? (
-                  <>
-                    <input type="range" min="100" max="10000" step="100" value={rangeDraft} onChange={(event) => setRangeDraft(Number(event.target.value))} />
-                    <div className="tm-range-presets">
-                      {[250, 500, 1000, 2000].map((preset) => (
-                        <button type="button" className={rangeDraft === preset ? "is-selected" : ""} key={preset} onClick={() => setRangeDraft(preset)}>
-                          {preset >= 1000 ? `${preset / 1000} km` : `${preset} m`}
-                        </button>
-                      ))}
-                      <button type="button" className="tm-save-range" onClick={() => void saveRange()} disabled={busy}>
-                        Save radius
-                      </button>
+
+                {/* Preset Options: 100m, 250m, 500m, 1,000m (1 km), 2,000m (2 km), and Custom */}
+                <div className="tm-range-presets" role="group" aria-label="Safety distance presets">
+                  {SAFETY_RADIUS_PRESETS.map((preset) => (
+                    <button
+                      type="button"
+                      key={preset.value}
+                      className={selectedPresetMatch && rangeDraft === preset.value ? "is-selected" : ""}
+                      onClick={() => handleSelectPreset(preset.value)}
+                      title={preset.description}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    className={isCustomRadiusMode ? "is-selected" : ""}
+                    onClick={handleSelectCustom}
+                    title="Enter custom distance in metres"
+                  >
+                    Custom
+                  </button>
+
+                  {isOwner && (
+                    <button
+                      type="button"
+                      className="tm-save-range"
+                      onClick={() => void saveRange()}
+                      disabled={busy || Boolean(customRadiusError) || rangeDraft === currentGroup.rangeMeters}
+                      title="Save this radius as the group limit on server"
+                    >
+                      {busy ? "Saving..." : rangeDraft === currentGroup.rangeMeters ? "Saved to group" : "Save as group limit"}
+                    </button>
+                  )}
+                </div>
+
+                {/* Custom numeric input with validation */}
+                {isCustomRadiusMode && (
+                  <div className="tm-custom-radius-form">
+                    <label style={{ fontSize: "11px", fontWeight: 700, display: "block", marginBottom: 6 }}>
+                      Enter custom distance in metres (radius):
+                    </label>
+                    <div className="tm-custom-radius-row">
+                      <input
+                        type="number"
+                        min={MIN_GROUP_RANGE_METERS}
+                        max={MAX_GROUP_RANGE_METERS}
+                        step={10}
+                        value={customRadiusInput}
+                        onChange={(e) => handleCustomDistanceChange(e.target.value)}
+                        placeholder="e.g. 750"
+                        aria-label="Custom safety radius in metres"
+                      />
+                      <span className="tm-custom-radius-unit">metres</span>
                     </div>
-                  </>
-                ) : null}
-                <p>When a sharing member moves beyond this distance, TravelMate triggers an audible tone and range alert.</p>
+                    {customRadiusError ? (
+                      <div className="tm-custom-radius-hint is-invalid">⚠️ {customRadiusError}</div>
+                    ) : (
+                      <div className="tm-custom-radius-hint is-valid">
+                        ✓ Valid radius: {formatRadiusDistance(rangeDraft)} (diameter: {formatRadiusDistance(rangeDraft * 2)})
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Clear Selected Distance & Dynamic Radius Explanation */}
+                <div className="tm-radius-summary-box">
+                  <p>
+                    <b>Selected Radius: {formatRadiusDistance(rangeDraft)}</b>
+                    <br />
+                    This distance is the radius from your latest GPS coordinates (coverage diameter:{" "}
+                    <b>{formatRadiusDistance(rangeDraft * 2)}</b>). When you move, the circle's centre updates with your fresh GPS
+                    coordinates while this radius remains unchanged.
+                  </p>
+                </div>
               </div>
 
-              <GroupSafetyMap members={status.members} rangeMeters={currentGroup.rangeMeters} fallbackCenter={mapDestination.coordinates} />
+              {/* Dynamic Leaflet Map with Live Center & Radius */}
+              <GroupSafetyMap
+                members={status.members}
+                rangeMeters={rangeDraft}
+                fallbackCenter={mapDestination.coordinates}
+                currentCoords={liveCoords}
+                isTracking={sharingLive}
+              />
 
+              {/* Group Members Section */}
               <section className="tm-group-members">
                 <div className="tm-group-section-head">
                   <div>
@@ -656,9 +1115,15 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                   <article className={member.isOutOfRange ? "is-out" : ""} key={member.id}>
                     <div className="tm-member-avatar">{member.name.slice(0, 1).toUpperCase()}</div>
                     <div>
-                      <b>{member.isSelf ? "You" : member.name}</b>
+                      <b>{member.isSelf ? "You (Safety circle centre)" : member.name}</b>
                       <p>
-                        {member.locationVisible ? `${formatUpdatedAt(member.locationUpdatedAt)}${member.distance && !member.isSelf ? ` • ${member.distance.toLocaleString("en-IN")} m from you` : ""}` : member.sharingEnabled ? "Location waiting to refresh" : "Location private"}
+                        {member.locationVisible
+                          ? `${formatUpdatedAt(member.locationUpdatedAt)}${
+                              member.distance && !member.isSelf ? ` • ${member.distance.toLocaleString("en-IN")} m from you` : ""
+                            }`
+                          : member.sharingEnabled
+                          ? "Location waiting to refresh"
+                          : "Location private"}
                       </p>
                     </div>
                     <span className={member.isOutOfRange ? "is-out" : member.locationVisible ? "is-live" : ""}>
@@ -668,6 +1133,7 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
                 ))}
               </section>
 
+              {/* Safety Alerts Section */}
               <section className="tm-group-alerts">
                 <div className="tm-group-section-head">
                   <div>
@@ -695,7 +1161,8 @@ export default function GroupSafetyPanel({ user, destination, onRequireAuth }: {
               </section>
 
               <p className="tm-group-privacy">
-                <ShieldAlert size={15} /> This is a consent-based safety feature, not an emergency service. Every member must choose to start their own location sharing.
+                <ShieldAlert size={15} /> This is a consent-based safety feature, not an emergency service. Every member must choose to
+                start their own location sharing.
               </p>
             </>
           ) : !loading && activeGroupId ? (

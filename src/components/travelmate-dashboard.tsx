@@ -64,6 +64,46 @@ import ProfileSettingsPanel from "@/components/profile-settings-panel";
 import PlaceDetailsModal from "@/components/place-details-modal";
 import TravelMateFooter from "@/components/travelmate-footer";
 
+declare global {
+  interface Window {
+    google?: {
+      accounts?: {
+        id?: {
+          initialize: (config: {
+            client_id: string;
+            callback: (response: { credential?: string; select_by?: string }) => void;
+            auto_select?: boolean;
+            cancel_on_tap_outside?: boolean;
+            context?: "signin" | "signup" | "use";
+            itp_support?: boolean;
+          }) => void;
+          renderButton: (
+            parent: HTMLElement,
+            options: {
+              type?: "standard" | "icon";
+              theme?: "outline" | "filled_blue" | "filled_black";
+              size?: "large" | "medium" | "small";
+              text?: "signin_with" | "signup_with" | "continue_with" | "signin";
+              shape?: "rectangular" | "pill" | "circle" | "square";
+              logo_alignment?: "left" | "center";
+              width?: number | string;
+            }
+          ) => void;
+          prompt: (momentListener?: (notification: {
+            isNotDisplayed: () => boolean;
+            isSkippedMoment: () => boolean;
+            isDismissedMoment: () => boolean;
+            getNotDisplayedReason: () => string;
+            getSkippedReason: () => string;
+            getDismissedReason: () => string;
+          }) => void) => void;
+          disableAutoSelect?: () => void;
+        };
+      };
+    };
+  }
+}
+
 type View = "home" | "explore" | "trips" | "saved" | "profile";
 type Panel = "planner" | "assistant" | "auth" | "emergency" | "budget" | "packing" | "map" | "group" | "profile-settings" | "notifications" | null;
 type Account = { id: number; name: string; email: string; avatarUrl?: string | null; isAdmin: boolean };
@@ -73,7 +113,18 @@ type SavedTrip = { id: number; title: string; destination: string; startDate?: s
 type PlannerForm = { destination: string; startLocation: string; startDate: string; endDate: string; days: number; travellers: number; budget: number; style: string };
 type LiveWeather = { temperature_2m: number; relative_humidity_2m: number; apparent_temperature: number; wind_speed_10m: number };
 type WeatherState = "loading" | "live" | "error" | "guide";
-type FeatureConfig = { auth: { googleConfigured: boolean; sessionsConfigured: boolean }; ai: { providerConfigured: boolean; activeProvider: string; availableProviders: string[] } };
+type FeatureConfig = {
+  auth: {
+    googleConfigured: boolean;
+    googleClientId?: string;
+    sessionsConfigured: boolean;
+  };
+  ai: {
+    providerConfigured: boolean;
+    activeProvider: string;
+    availableProviders: string[];
+  };
+};
 type ChatMessage = { role: "user" | "assistant"; content: string; source?: string };
 type SearchState = "idle" | "loading" | "success" | "error";
 
@@ -96,6 +147,29 @@ const starterLocations: RouteLocation[] = [
 ];
 
 const rajasthanThemes = ["All", "Heritage", "Desert", "Lakes", "Wildlife", "Hill station", "Spiritual", "Culture", "Food", "Shopping", "Photography"] as const;
+
+function GoogleGIcon({ className = "tm-google-icon" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="#4285F4"
+        d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
+      />
+    </svg>
+  );
+}
 
 function IconButton({ children, label, onClick, active = false }: { children: ReactNode; label: string; onClick?: () => void; active?: boolean }) {
   return (
@@ -663,12 +737,51 @@ export default function TravelMateDashboard() {
     }
   }
 
+  async function submitGoogleAuth(idToken: string): Promise<{ ok: boolean; error?: string }> {
+    setAuthBusy(true);
+    try {
+      const response = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "google", idToken }),
+      });
+      const data = (await response.json()) as { user?: Account; error?: string };
+      if (!response.ok || !data.user) {
+        const errorMsg = data.error || "Google authentication failed. Please try again.";
+        setToast(errorMsg);
+        return { ok: false, error: errorMsg };
+      }
+      setUser(data.user);
+      setPanel(null);
+      setToast(`Welcome to TravelMate, ${data.user.name.split(" ")[0]}!`);
+      void loadPersonal();
+      return { ok: true };
+    } catch {
+      const netError = "Unable to reach authentication service. Please check your network connection.";
+      setToast(netError);
+      return { ok: false, error: netError };
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
   async function logout() {
-    await fetch("/api/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "logout" }),
-    });
+    try {
+      await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "logout" }),
+      });
+    } catch {
+      // ignore network errors on logout
+    }
+    if (typeof window !== "undefined" && window.google?.accounts?.id?.disableAutoSelect) {
+      try {
+        window.google.accounts.id.disableAutoSelect();
+      } catch {
+        // ignore
+      }
+    }
     setUser(null);
     setSavedPlaces([]);
     setTrips([]);
@@ -1836,6 +1949,9 @@ export default function TravelMateDashboard() {
           setAuthForm={setAuthForm}
           authBusy={authBusy}
           submitAuth={submitAuth}
+          googleConfigured={featureConfig.auth.googleConfigured}
+          googleClientId={featureConfig.auth.googleClientId}
+          onGoogleAuth={submitGoogleAuth}
           assistantMessage={assistantMessage}
           setAssistantMessage={setAssistantMessage}
           assistantMessages={assistantMessages}
@@ -1886,6 +2002,9 @@ function PanelOverlay({
   setAuthForm,
   authBusy,
   submitAuth,
+  googleConfigured,
+  googleClientId,
+  onGoogleAuth,
   assistantMessage,
   setAssistantMessage,
   assistantMessages,
@@ -1930,6 +2049,9 @@ function PanelOverlay({
   setAuthForm: (value: { name: string; email: string; password: string }) => void;
   authBusy: boolean;
   submitAuth: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  googleConfigured?: boolean;
+  googleClientId?: string;
+  onGoogleAuth?: (idToken: string) => Promise<{ ok: boolean; error?: string } | void>;
   assistantMessage: string;
   setAssistantMessage: (value: string) => void;
   assistantMessages: ChatMessage[];
@@ -2009,6 +2131,9 @@ function PanelOverlay({
             setForm={setAuthForm}
             busy={authBusy}
             submit={submitAuth}
+            googleConfigured={googleConfigured}
+            googleClientId={googleClientId}
+            onGoogleAuth={onGoogleAuth}
           />
         )}
         {panel === "emergency" && <EmergencyPanel destination={destination} />}
@@ -2389,6 +2514,9 @@ function AuthPanel({
   setForm,
   busy,
   submit,
+  googleConfigured = false,
+  googleClientId,
+  onGoogleAuth,
 }: {
   mode: "login" | "signup" | "forgot";
   setMode: (value: "login" | "signup" | "forgot") => void;
@@ -2396,8 +2524,161 @@ function AuthPanel({
   setForm: (value: { name: string; email: string; password: string }) => void;
   busy: boolean;
   submit: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  googleConfigured?: boolean;
+  googleClientId?: string;
+  onGoogleAuth?: (idToken: string) => Promise<{ ok: boolean; error?: string } | void>;
 }) {
   const update = (key: "name" | "email" | "password", value: string) => setForm({ ...form, [key]: value });
+  const googleBtnContainerRef = useRef<HTMLDivElement>(null);
+  const [gisRendered, setGisRendered] = useState(false);
+  const [authNotice, setAuthNotice] = useState<{ message: string; type: "error" | "info" } | null>(null);
+
+  useEffect(() => {
+    if (mode === "forgot") return;
+    setAuthNotice(null);
+
+    let timer: number;
+    let attempts = 0;
+
+    function renderGisButton() {
+      if (!googleConfigured || !googleClientId) return;
+      if (typeof window === "undefined") return;
+
+      if (window.google?.accounts?.id) {
+        try {
+          window.google.accounts.id.initialize({
+            client_id: googleClientId,
+            callback: async (response: { credential?: string }) => {
+              if (response.credential && onGoogleAuth) {
+                setAuthNotice(null);
+                const res = await onGoogleAuth(response.credential);
+                if (res && !res.ok && res.error) {
+                  setAuthNotice({
+                    message: res.error,
+                    type: "error",
+                  });
+                }
+              } else {
+                setAuthNotice({
+                  message: "No credential returned from Google. Please try again.",
+                  type: "error",
+                });
+              }
+            },
+            auto_select: false,
+            cancel_on_tap_outside: true,
+            context: mode === "signup" ? "signup" : "signin",
+            itp_support: true,
+          });
+
+          if (googleBtnContainerRef.current) {
+            googleBtnContainerRef.current.innerHTML = "";
+            window.google.accounts.id.renderButton(googleBtnContainerRef.current, {
+              type: "standard",
+              theme: "outline",
+              size: "large",
+              text: mode === "signup" ? "signup_with" : "continue_with",
+              shape: "rectangular",
+              logo_alignment: "left",
+              width: 300,
+            });
+            setGisRendered(true);
+          }
+        } catch {
+          setGisRendered(false);
+        }
+      } else if (attempts < 20) {
+        attempts++;
+        timer = window.setTimeout(renderGisButton, 250);
+      }
+    }
+
+    renderGisButton();
+
+    return () => {
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [mode, googleConfigured, googleClientId, onGoogleAuth]);
+
+  function handleGoogleCustomClick() {
+    setAuthNotice(null);
+    if (!googleConfigured || !googleClientId) {
+      setAuthNotice({
+        message: "Google Sign-In is not configured yet. Please configure the GOOGLE_CLIENT_ID environment variable in your deployment environment.",
+        type: "info",
+      });
+      return;
+    }
+    if (!window.google?.accounts?.id) {
+      setAuthNotice({
+        message: "Google Identity Services is currently unavailable. Please verify your internet connection or check if content/popup blockers are active.",
+        type: "error",
+      });
+      return;
+    }
+    try {
+      window.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: async (response: { credential?: string }) => {
+          if (response.credential && onGoogleAuth) {
+            setAuthNotice(null);
+            const res = await onGoogleAuth(response.credential);
+            if (res && !res.ok && res.error) {
+              setAuthNotice({
+                message: res.error,
+                type: "error",
+              });
+            }
+          } else {
+            setAuthNotice({
+              message: "No credential returned from Google. Please try again.",
+              type: "error",
+            });
+          }
+        },
+        auto_select: false,
+        cancel_on_tap_outside: true,
+        context: mode === "signup" ? "signup" : "signin",
+        itp_support: true,
+      });
+
+      if (googleBtnContainerRef.current) {
+        googleBtnContainerRef.current.innerHTML = "";
+        window.google.accounts.id.renderButton(googleBtnContainerRef.current, {
+          type: "standard",
+          theme: "outline",
+          size: "large",
+          text: mode === "signup" ? "signup_with" : "continue_with",
+          shape: "rectangular",
+          logo_alignment: "left",
+          width: 300,
+        });
+        setGisRendered(true);
+      }
+
+      window.google.accounts.id.prompt((notification) => {
+        if (notification.isNotDisplayed()) {
+          const reason = notification.getNotDisplayedReason?.() || "";
+          if (reason === "suppressed_by_user") {
+            setAuthNotice({
+              message: "Google prompt was suppressed by browser settings. Please use the Google button or email login.",
+              type: "info",
+            });
+          }
+        } else if (notification.isSkippedMoment()) {
+          setAuthNotice({
+            message: "Google sign-in was dismissed. You can try again or use email sign-in.",
+            type: "info",
+          });
+        }
+      });
+    } catch {
+      setAuthNotice({
+        message: "Could not open Google Sign-In. Please check your browser popup settings and try again.",
+        type: "error",
+      });
+    }
+  }
 
   return (
     <div className="tm-panel-body tm-auth-body">
@@ -2408,6 +2689,44 @@ function AuthPanel({
           ? "Enter your email to receive password reset guidance."
           : "Your plans, saved places, and memories are waiting."}
       </p>
+
+      {authNotice && (
+        <div className={`tm-auth-notice is-${authNotice.type}`} role="alert">
+          <ShieldAlert size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>{authNotice.message}</span>
+        </div>
+      )}
+
+      {mode !== "forgot" && (
+        <div className="tm-google-auth-section">
+          <div className="tm-google-btn-wrapper">
+            {googleConfigured && googleClientId ? (
+              <div
+                ref={googleBtnContainerRef}
+                className="tm-google-btn-container"
+                style={{ display: gisRendered ? "flex" : "none" }}
+              />
+            ) : null}
+            {(!googleConfigured || !gisRendered) && (
+              <button
+                type="button"
+                className="tm-google-custom-button"
+                onClick={handleGoogleCustomClick}
+                disabled={busy}
+              >
+                <GoogleGIcon />
+                <span>
+                  {mode === "signup" ? "Sign up with Google" : "Continue with Google"}
+                </span>
+              </button>
+            )}
+          </div>
+
+          <div className="tm-auth-divider">
+            <span>or continue with email</span>
+          </div>
+        </div>
+      )}
 
       <form className="tm-auth-form" onSubmit={(event) => void submit(event)}>
         {mode === "signup" && (
